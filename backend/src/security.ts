@@ -16,12 +16,19 @@ export const ROLES = Object.freeze({
   patient_relations_officer: ['workspace:read', 'patient:read', 'call:read', 'call:write', 'task:read', 'task:write', 'message:draft', 'analytics:read'],
   supervisor: ['workspace:read', 'patient:read', 'call:read', 'call:write', 'task:read', 'task:write', 'appointment:read', 'appointment:write', 'directory:read', 'message:draft', 'analytics:read', 'document:read', 'document:write', 'admission:read', 'admission:write', 'discharge:read', 'discharge:write', 'insurance:read', 'insurance:write', 'billing:read', 'billing:write', 'medical-record:read', 'medical-record:write', 'audit:read'],
   auditor: ['workspace:read', 'patient:read', 'call:read', 'task:read', 'appointment:read', 'directory:read', 'analytics:read', 'document:read', 'admission:read', 'discharge:read', 'insurance:read', 'billing:read', 'medical-record:read', 'audit:read'],
-  patient: ['patient:portal:read']
+  patient: ['patient:portal:read', 'directory:read']
 });
 
 export function can(role, permission) {
   const rules = ROLES[role] || [];
   return rules.includes('*') || rules.includes(permission);
+}
+
+export function roleMatchesAccountType(role: string, accountType: string) {
+  if (accountType === 'patient') return role === 'patient';
+  if (accountType === 'admin') return role === 'admin';
+  if (accountType === 'staff') return !['patient', 'admin'].includes(role);
+  return false;
 }
 
 export function signAccessToken(user: { _id: unknown; role: string; email: string }, secret: string, expiresIn: SignOptions['expiresIn'] = '8h', hospitalId?: string) {

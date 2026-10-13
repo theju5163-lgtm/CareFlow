@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { can, signAccessToken, validStatusTransition, verifyAccessToken } from './security.js';
+import { can, roleMatchesAccountType, signAccessToken, validStatusTransition, verifyAccessToken } from './security.js';
 test('role permissions grant staff workflow access but deny admin-only management', () => {
     assert.equal(can('staff', 'call:write'), true);
     assert.equal(can('staff', 'user:manage'), false);
@@ -8,6 +8,13 @@ test('role permissions grant staff workflow access but deny admin-only managemen
     assert.equal(can('patient', 'patient:read'), false);
     assert.equal(can('admin', 'user:manage'), true);
     assert.equal(can('unknown', 'call:read'), false);
+});
+test('selected login account type must match hospital membership role', () => {
+    assert.equal(roleMatchesAccountType('patient', 'patient'), true);
+    assert.equal(roleMatchesAccountType('admin', 'admin'), true);
+    assert.equal(roleMatchesAccountType('appointment_coordinator', 'staff'), true);
+    assert.equal(roleMatchesAccountType('patient', 'staff'), false);
+    assert.equal(roleMatchesAccountType('staff', 'admin'), false);
 });
 test('task state machine accepts workflow moves and rejects terminal-state reopening', () => {
     assert.equal(validStatusTransition('Pending', 'In Progress'), true);

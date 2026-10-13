@@ -20,10 +20,10 @@ Status describes the current application in this repository. `Implemented` means
 | 14 | Task details | Partial | Task status, assignee, due date and notes exist; source conversation/history detail view is limited. |
 | 15 | Department work queue | Partial | Tasks can be department-assigned; dedicated department queue screen is absent. |
 | 16 | Task resolution | Partial | Status transitions, notes and history exist; resolution-evidence workflow is incomplete. |
-| 17 | Department directory | Removed | Standalone page and department-management UI/API creation route removed per updated project requirements; legacy lookups remain for existing records. |
-| 18 | Department details | Not implemented | No dedicated department profile/queue view. |
-| 19 | Staff directory | Partial | Hospital membership list, role, activation, staff ID, job title and department controls; assignment history is absent. |
-| 20 | Staff profile | Not implemented | No dedicated staff profile/assignment history screen. |
+| 17 | Department directory | Implemented in source | Admin-only Departments sidebar page lists live hospital departments, codes, descriptions, status and counts; default initialization is idempotent. Authenticated CRUD was not live-verified during this task. |
+| 18 | Department details | Implemented in source | Detail view loads department and assigned memberships by MongoDB ObjectId; includes manager assignment and add-staff flow. |
+| 19 | Staff directory | Implemented in source | Membership-backed search and filters for employee ID/name/email, department, title and status; includes profile edit, reassignment, and activation. |
+| 20 | Staff profile | Partial | Editable profile fields and access status exist; no assignment-history timeline is exposed. |
 | 21 | User roles and permissions | Partial | Backend enforces a 16-role catalog per hospital and tasks route to staff-role labels; a custom permission editor is absent. |
 | 22 | Patient directory | Implemented | Tenant-scoped patient records and search; fields are intentionally limited by authorization. |
 | 23 | Patient registration | Partial | Patient creation exists; duplicate detection and full registration/identity validation are incomplete. |

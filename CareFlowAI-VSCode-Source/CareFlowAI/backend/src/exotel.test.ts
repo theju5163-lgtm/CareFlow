@@ -9,6 +9,7 @@ test('Indian phone normalization accepts 10-digit and +91 mobile numbers only', 
   assert.equal(normalizeIndiaNumber('+14155550100'), null);
 });
 
+
 test('Exotel call states are normalized and unknown states never overwrite provider state', () => {
   assert.equal(mapExotelStatus('ringing'), 'Ringing');
   assert.equal(mapExotelStatus('in-progress'), 'In Progress');

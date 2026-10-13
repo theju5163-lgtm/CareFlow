@@ -26,9 +26,13 @@ const hospitalMembershipSchema = new Schema({
     role: { type: String, enum: roles, default: 'staff' },
     departmentId: { type: Schema.Types.ObjectId, ref: 'Department', default: null },
     patientId: { type: Schema.Types.ObjectId, ref: 'Patient', default: null },
+    employeeId: { type: String, trim: true, uppercase: true, maxlength: 80, default: '' },
+    jobTitle: { type: String, trim: true, maxlength: 120, default: '' },
+    phone: { type: String, trim: true, maxlength: 40, default: '' },
     active: { type: Boolean, default: true }
 }, opts);
 hospitalMembershipSchema.index({ hospitalId: 1, userId: 1 }, { unique: true });
+hospitalMembershipSchema.index({ hospitalId: 1, employeeId: 1 }, { unique: true, partialFilterExpression: { employeeId: { $type: 'string', $gt: '' } } });
 const userSchema = new Schema({
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
@@ -53,11 +57,15 @@ patientSchema.plugin(tenantPlugin);
 patientSchema.index({ displayName: 'text', externalId: 'text' });
 const departmentSchema = new Schema({
     name: { type: String, required: true, trim: true, maxlength: 100 },
+    code: { type: String, trim: true, uppercase: true, maxlength: 16, default: '' },
     description: { type: String, trim: true, maxlength: 500, default: '' },
+    managerStaffId: { type: Schema.Types.ObjectId, ref: 'HospitalMembership', default: null },
+    active: { type: Boolean, default: true },
     isDemo: { type: Boolean, default: false }
 }, opts);
 departmentSchema.plugin(tenantPlugin);
 departmentSchema.index({ name: 1, isDemo: 1, hospitalId: 1 }, { unique: true });
+departmentSchema.index({ code: 1, isDemo: 1, hospitalId: 1 }, { unique: true, partialFilterExpression: { code: { $type: 'string', $gt: '' } } });
 const transcriptSegmentSchema = new Schema({
     speaker: { type: String, enum: ['Doctor', 'Nurse', 'Patient', 'Caregiver', 'Staff', 'Unknown'], default: 'Unknown' },
     text: { type: String, required: true, maxlength: 8000 },
@@ -149,11 +157,28 @@ const appointmentSchema = new Schema({
     scheduledAt: { type: Date, required: true },
     room: { type: String, trim: true, maxlength: 100, default: '' },
     confirmedByStaff: { type: Boolean, default: false },
+    requestStatus: { type: String, enum: ['none', 'requested', 'reschedule_requested', 'cancellation_requested', 'confirmed', 'rejected'], default: 'none' },
+    requestedScheduledAt: { type: Date, default: null },
+    patientRequestNote: { type: String, trim: true, maxlength: 500, default: '' },
+    requestedAt: { type: Date, default: null },
     status: { type: String, enum: ['Scheduled', 'Completed', 'Cancelled'], default: 'Scheduled' },
     isDemo: { type: Boolean, default: false },
     createdBy: { type: Schema.Types.ObjectId, ref: 'User', required: true }
 }, opts);
 appointmentSchema.plugin(tenantPlugin);
+const messageSchema = new Schema({
+    patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true },
+    appointmentId: { type: Schema.Types.ObjectId, ref: 'Appointment', default: null },
+    body: { type: String, required: true, trim: true, maxlength: 4000 },
+    status: { type: String, enum: ['Pending Approval', 'Approved', 'Rejected'], default: 'Pending Approval' },
+    channel: { type: String, enum: ['Patient portal', 'SMS', 'Email'], default: 'Patient portal' },
+    deliveryStatus: { type: String, enum: ['Not sent', 'Visible in patient portal', 'Provider not configured'], default: 'Not sent' },
+    createdBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+    reviewedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    reviewedAt: { type: Date, default: null },
+    isDemo: { type: Boolean, default: false }
+}, opts);
+messageSchema.plugin(tenantPlugin);
 const historyRows = [{ status: String, note: String, at: { type: Date, default: Date.now }, by: { type: Schema.Types.ObjectId, ref: 'User' } }];
 const admissionSchema = new Schema({
     patientId: { type: Schema.Types.ObjectId, ref: 'Patient', required: true }, departmentId: { type: Schema.Types.ObjectId, ref: 'Department', required: true },
@@ -233,6 +258,7 @@ export const Department = model('Department', departmentSchema);
 export const Call = model('Call', callSchema);
 export const Task = model('Task', taskSchema);
 export const Appointment = model('Appointment', appointmentSchema);
+export const PatientMessage = model('PatientMessage', messageSchema);
 export const Admission = model('Admission', admissionSchema);
 export const Discharge = model('Discharge', dischargeSchema);
 export const InsuranceCase = model('InsuranceCase', insuranceCaseSchema);

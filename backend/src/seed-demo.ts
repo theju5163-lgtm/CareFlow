@@ -13,11 +13,11 @@ try {
   // Every synthetic record is created inside this user's tenant context.
   await runInHospital(String(admin.hospitalId), async () => {
   const definitions = [
-    ['Cardiology', 'Sample cardiology department'], ['Scheduling', 'Appointment coordination'],
-    ['Patient Support', 'Directions and arrival support'], ['Front Desk', 'Registration and document checklists'], ['Billing', 'Administrative billing inquiries']
+    ['Cardiology', 'CARD', 'Sample cardiology department'], ['Scheduling', 'APPT', 'Appointment coordination'],
+    ['Patient Support', 'PSUP', 'Directions and arrival support'], ['Front Desk', 'FRONT', 'Registration and document checklists'], ['Billing', 'BILL', 'Administrative billing inquiries']
   ];
   const departments = {};
-  for (const [name, description] of definitions) departments[name] = await Department.findOneAndUpdate({ name, isDemo: true }, { $setOnInsert: { name, description, isDemo: true } }, { upsert: true, new: true });
+  for (const [name, code, description] of definitions) departments[name] = await Department.findOneAndUpdate({ name, isDemo: true }, { $setOnInsert: { name, code, description, isDemo: true } }, { upsert: true, new: true });
   const ramesh = await Patient.findOneAndUpdate({ externalId: 'DEMO-P-10245', isDemo: true }, { $setOnInsert: { displayName: 'Ramesh Kumar', externalId: 'DEMO-P-10245', consentToProcessing: false, isDemo: true, createdBy: admin._id } }, { upsert: true, new: true });
   const meera = await Patient.findOneAndUpdate({ externalId: 'DEMO-P-10382', isDemo: true }, { $setOnInsert: { displayName: 'Meera Nair', externalId: 'DEMO-P-10382', consentToProcessing: false, isDemo: true, createdBy: admin._id } }, { upsert: true, new: true });
   let call = await Call.findOne({ callerLabel: 'Ramesh Kumar', isDemo: true });

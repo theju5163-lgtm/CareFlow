@@ -7,8 +7,8 @@ import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import multer from 'multer';
 import rateLimit from 'express-rate-limit';
-import { Hospital, HospitalMembership, User, Patient, Department, Call, Task, Appointment, Admission, Discharge, InsuranceCase, BillingRecord, MedicalRecord, DocumentChecklist, FollowUp, AuditLog } from './models.js';
-import { can, signAccessToken, validStatusTransition } from './security.js';
+import { Hospital, HospitalMembership, User, Patient, Department, Call, Task, Appointment, PatientMessage, Admission, Discharge, InsuranceCase, BillingRecord, MedicalRecord, DocumentChecklist, FollowUp, AuditLog } from './models.js';
+import { can, roleMatchesAccountType, signAccessToken, validStatusTransition } from './security.js';
 import { connectToCareFlowDatabase } from './config/database.js';
 import { runInHospital, runWithoutHospital } from './tenant-context.js';
 import { exotelConfiguration, initiateExotelCall, endExotelCall, getExotelCallStatus, mapExotelStatus, normalizeIndiaNumber, validExotelWebhookToken } from './services/exotel.js';
@@ -110,6 +110,9 @@ app.post('/api/auth/login', loginLimiter, asyncRoute(async (req, res) => {
   const hospital = await Hospital.findById(hospitalId).select('name status currency timeZone');
   if (!hospital || hospital.status === 'suspended') return fail(res, 403, 'This hospital workspace is unavailable.');
   const selectedMembership = membershipRows.find(m => String(m.hospitalId) === hospitalId);
+  const accountType = req.body?.accountType;
+  if (accountType && !['patient', 'staff', 'admin'].includes(accountType)) return fail(res, 400, 'Choose Patient, Staff, or Administrator.');
+  if (accountType && !roleMatchesAccountType(selectedMembership.role, accountType)) return fail(res, 403, 'This account does not have the selected account type in this hospital.');
   const token = signAccessToken({ _id: user._id, role: selectedMembership.role, email: user.email }, jwtSecret, process.env.JWT_EXPIRES_IN || '8h', hospitalId);
   await runInHospital(hospitalId, () => audit(user._id, 'auth.login', 'User', user._id, { role: user.role }));
   const hospitalRows = await Hospital.find({ _id: { $in: memberships } }).select('name status currency timeZone').lean();
@@ -187,34 +190,77 @@ app.get('/api/patient/portal', asyncRoute(async (req, res) => {
   if (!allowed(req, res, 'patient:portal:read')) return;
   if (!req.user.patientId) return fail(res, 403, 'This patient login is not linked to a patient profile. Contact the hospital administrator.');
   const patientId = req.user.patientId;
-  const [patient, appointments, calls, tasks, documents, followups] = await Promise.all([
+  const [patient, appointments, previousAppointments, appointmentRequests, calls, tasks, documents, followups, messages] = await Promise.all([
     Patient.findOne({ _id: patientId, isDemo: false }).select('displayName externalId phone email').lean(),
     Appointment.find({ patientId, isDemo: false, confirmedByStaff: true, status: 'Scheduled' }).sort({ scheduledAt: 1 }).populate('departmentId', 'name').lean(),
+    Appointment.find({ patientId, isDemo: false, status: { $in: ['Completed', 'Cancelled'] } }).sort({ scheduledAt: -1 }).limit(50).populate('departmentId', 'name').lean(),
+    Appointment.find({ patientId, isDemo: false, requestStatus: { $in: ['requested', 'reschedule_requested', 'cancellation_requested', 'rejected'] } }).sort({ requestedAt: -1 }).populate('departmentId', 'name').lean(),
     Call.find({ patientId, isDemo: false }).select('createdAt status category summary patientRequests language').sort({ createdAt: -1 }).limit(50).lean(),
     Task.find({ patientId, isDemo: false, status: { $nin: ['Cancelled'] } }).select('title status dueAt').sort({ dueAt: 1 }).lean(),
     DocumentChecklist.find({ patientId, isDemo: false }).select('name status appointmentId').sort({ createdAt: -1 }).lean(),
-    FollowUp.find({ patientId, isDemo: false }).select('taskId dueAt status note').sort({ dueAt: 1 }).populate('taskId', 'title').lean()
+    FollowUp.find({ patientId, isDemo: false }).select('taskId dueAt status note').sort({ dueAt: 1 }).populate('taskId', 'title').lean(),
+    PatientMessage.find({ patientId, isDemo: false, status: 'Approved', channel: 'Patient portal' }).select('body createdAt deliveryStatus').sort({ createdAt: -1 }).limit(100).lean()
   ]);
   if (!patient) return fail(res, 404, 'Linked patient profile is unavailable.');
-  res.json({ patient, appointments, callSummaries: calls, tasks, documents, followups, mode: 'patient-owned-live-records' });
+  res.json({ patient, appointments, previousAppointments, appointmentRequests, callSummaries: calls, tasks, documents, followups, messages, mode: 'patient-owned-live-records' });
+}));
+
+app.post('/api/patient/appointments', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'patient:portal:read')) return;
+  const patientId = req.user.patientId;
+  const departmentId = req.body?.departmentId;
+  const scheduledAt = new Date(req.body?.scheduledAt);
+  if (!patientId || !parseId(departmentId) || Number.isNaN(scheduledAt.getTime()) || scheduledAt <= new Date()) return fail(res, 400, 'Choose a department and a future preferred date and time.');
+  const department = await Department.findOne({ _id: departmentId, isDemo: false, $or: [{ active: true }, { active: { $exists: false } }] });
+  if (!department) return fail(res, 404, 'Department is unavailable.');
+  const appointment = await Appointment.create({ patientId, departmentId, scheduledAt, requestedScheduledAt: scheduledAt, requestStatus: 'requested', requestedAt: new Date(), patientRequestNote: clean(req.body?.note).slice(0, 500), confirmedByStaff: false, status: 'Scheduled', isDemo: false, createdBy: req.user._id });
+  await audit(req.user._id, 'patient.appointment_requested', 'Appointment', appointment._id);
+  res.status(201).json({ id: appointment.id, requestStatus: appointment.requestStatus, requestedAt: appointment.requestedAt });
+}));
+app.post('/api/patient/appointments/:id/reschedule', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'patient:portal:read')) return;
+  const date = new Date(req.body?.scheduledAt);
+  if (!req.user.patientId || !parseId(req.params.id) || Number.isNaN(date.getTime()) || date <= new Date()) return fail(res, 400, 'Choose a valid future date and time.');
+  const appointment = await Appointment.findOne({ _id: req.params.id, patientId: req.user.patientId, isDemo: false, confirmedByStaff: true, status: 'Scheduled' });
+  if (!appointment) return fail(res, 404, 'Confirmed appointment not found.');
+  appointment.requestStatus = 'reschedule_requested'; appointment.requestedScheduledAt = date; appointment.requestedAt = new Date(); appointment.patientRequestNote = clean(req.body?.note).slice(0, 500); await appointment.save();
+  await audit(req.user._id, 'patient.appointment_reschedule_requested', 'Appointment', appointment._id);
+  res.json({ requestStatus: appointment.requestStatus, requestedAt: appointment.requestedAt });
+}));
+app.post('/api/patient/appointments/:id/cancel', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'patient:portal:read')) return;
+  if (!req.user.patientId || !parseId(req.params.id)) return fail(res, 400, 'Invalid appointment.');
+  const appointment = await Appointment.findOne({ _id: req.params.id, patientId: req.user.patientId, isDemo: false, confirmedByStaff: true, status: 'Scheduled' });
+  if (!appointment) return fail(res, 404, 'Upcoming confirmed appointment not found.');
+  if (appointment.requestStatus === 'cancellation_requested') return fail(res, 409, 'A cancellation request is already waiting for staff review.');
+  appointment.requestStatus = 'cancellation_requested'; appointment.requestedAt = new Date(); appointment.patientRequestNote = clean(req.body?.note).slice(0, 500); await appointment.save();
+  await audit(req.user._id, 'patient.appointment_cancellation_requested', 'Appointment', appointment._id);
+  res.json({ requestStatus: appointment.requestStatus, requestedAt: appointment.requestedAt });
 }));
 
 app.get('/api/users', asyncRoute(async (req, res) => {
   if (!allowed(req, res, 'user:manage')) return;
-  res.json(await HospitalMembership.find({ hospitalId: req.hospital._id, active: true }).populate({ path: 'userId', match: { active: true }, select: 'name email staffId jobTitle active createdAt' }).populate('departmentId', 'name').sort({ role: 1 }).lean());
+  res.json(await HospitalMembership.find({ hospitalId: req.hospital._id }).populate({ path: 'userId', select: 'name email active createdAt' }).populate('departmentId', 'name code active').sort({ role: 1 }).lean());
 }));
 app.post('/api/users', asyncRoute(async (req, res) => {
   if (!allowed(req, res, 'user:manage')) return;
   const name = clean(req.body?.name), email = clean(req.body?.email).toLowerCase(), password = req.body?.password;
   const role = accountRoles.includes(req.body?.role) ? req.body.role : 'staff';
   if (!name || !/^\S+@\S+\.\S+$/.test(email) || typeof password !== 'string' || password.length < 12) return fail(res, 400, 'Provide a name, valid email, and password with at least 12 characters.');
+  if (req.body?.active !== undefined && typeof req.body.active !== 'boolean') return fail(res, 400, 'Account status must be active or inactive.');
+  const active = req.body?.active !== false;
   if (await runWithoutHospital(async () => await User.exists({ email }))) return fail(res, 409, 'This email already has an account. Use Grant hospital access for an existing account.');
   if (req.body?.departmentId && (!parseId(req.body.departmentId) || !await Department.exists({ _id: req.body.departmentId }))) return fail(res, 400, 'Department is not part of this hospital.');
   if (role === 'patient' && (!parseId(req.body?.patientId) || !await Patient.exists({ _id: req.body.patientId, isDemo: false }))) return fail(res, 400, 'Patient accounts must be linked to one existing live patient record.');
-  const user = await User.create({ hospitalId: req.hospital._id, hospitalIds: [req.hospital._id], name, email, staffId: clean(req.body?.staffId).slice(0, 80), jobTitle: clean(req.body?.jobTitle).slice(0, 120), role, departmentId: req.body?.departmentId || null, patientId: role === 'patient' ? req.body.patientId : null, passwordHash: await bcrypt.hash(password, 12), active: true });
-  await HospitalMembership.create({ hospitalId: req.hospital._id, userId: user._id, role, departmentId: parseId(req.body?.departmentId) ? req.body.departmentId : null, patientId: role === 'patient' ? req.body.patientId : null, active: true });
+  const employeeId = clean(req.body?.employeeId || req.body?.staffId).toUpperCase().slice(0, 80);
+  const departmentId = req.body?.departmentId || null;
+  if (req.body?.departmentId && (!parseId(req.body.departmentId) || !await Department.exists({ _id: req.body.departmentId, active: { $ne: false } }))) return fail(res, 400, 'Department is not active in this hospital.');
+  const user = await User.create({ hospitalId: req.hospital._id, hospitalIds: [req.hospital._id], name, email, role, departmentId, patientId: role === 'patient' ? req.body.patientId : null, passwordHash: await bcrypt.hash(password, 12), active });
+  let membership;
+  try { membership = await HospitalMembership.create({ hospitalId: req.hospital._id, userId: user._id, role, departmentId, employeeId, jobTitle: clean(req.body?.jobTitle).slice(0, 120), phone: clean(req.body?.phone).slice(0, 40), patientId: role === 'patient' ? req.body.patientId : null, active }); }
+  catch (error) { await runWithoutHospital(() => User.deleteOne({ _id: user._id })); throw error; }
   await audit(req.user._id, 'user.created', 'User', user._id, { role });
-  res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role, patientId: user.patientId || null });
+  res.status(201).json({ id: user.id, membershipId: membership.id, employeeId, name: user.name, email: user.email, role: user.role, departmentId, jobTitle: membership.jobTitle, phone: membership.phone, active, patientId: user.patientId || null });
 }));
 app.post('/api/users/membership', asyncRoute(async (req, res) => {
   if (!allowed(req, res, 'user:manage')) return;
@@ -243,16 +289,17 @@ app.patch('/api/users/:id/membership', asyncRoute(async (req, res) => {
   const nextRole = req.body?.role;
   const nextActive = req.body?.active;
   if (nextRole !== undefined && !accountRoles.includes(nextRole)) return fail(res, 400, 'Unsupported hospital role.');
+  if (nextRole === 'patient' && await Department.exists({ managerStaffId: membership._id })) return fail(res, 409, 'Remove this staff member as department manager before changing to a patient role.');
   if (nextActive === false && membership.active && membership.role === 'admin' && await HospitalMembership.countDocuments({ hospitalId: req.hospital._id, role: 'admin', active: true }) <= 1) return fail(res, 409, 'The final active hospital administrator cannot be deactivated.');
   if (nextRole && membership.role === 'admin' && nextRole !== 'admin' && await HospitalMembership.countDocuments({ hospitalId: req.hospital._id, role: 'admin', active: true }) <= 1) return fail(res, 409, 'Assign another hospital administrator before changing this role.');
   if (nextRole) membership.role = nextRole;
-  if (typeof nextActive === 'boolean') membership.active = nextActive;
+  if (typeof nextActive === 'boolean') { membership.active = nextActive; if (!nextActive) await Department.updateOne({ managerStaffId: membership._id }, { $set: { managerStaffId: null } }); }
   if (req.body?.patientId !== undefined) {
     if (membership.role !== 'patient' || !parseId(req.body.patientId) || !await Patient.exists({ _id: req.body.patientId, isDemo: false })) return fail(res, 400, 'Patient account links must point to a live patient record in this hospital.');
     membership.patientId = req.body.patientId;
   }
   if (req.body?.departmentId !== undefined) {
-    if (req.body.departmentId && (!parseId(req.body.departmentId) || !await Department.exists({ _id: req.body.departmentId }))) return fail(res, 400, 'Department is not part of this hospital.');
+    if (req.body.departmentId && (!parseId(req.body.departmentId) || !await Department.exists({ _id: req.body.departmentId, active: { $ne: false } }))) return fail(res, 400, 'Department is not active in this hospital.');
     membership.departmentId = req.body.departmentId || null;
   }
   await membership.save();
@@ -288,7 +335,132 @@ app.get('/api/workspace', asyncRoute(async (req, res) => {
 
 app.get('/api/departments', asyncRoute(async (req, res) => {
   if (!allowed(req, res, 'directory:read')) return;
-  res.json(await Department.find({ isDemo: isDemoMode(req) }).sort({ name: 1 }).lean());
+  const departments = await Department.find({ isDemo: isDemoMode(req), ...(req.user.role === 'admin' ? {} : { $or: [{ active: true }, { active: { $exists: false } }] }) }).sort({ name: 1 }).lean();
+  const ids = departments.map(d => d._id);
+  const counts = await HospitalMembership.aggregate([{ $match: { hospitalId: req.hospital._id, departmentId: { $in: ids }, role: { $ne: 'patient' } } }, { $group: { _id: '$departmentId', total: { $sum: 1 }, active: { $sum: { $cond: ['$active', 1, 0] } } } }]);
+  const countMap = new Map(counts.map(c => [String(c._id), c]));
+  res.json(departments.map(d => ({ ...d, code: d.code || '', active: d.active !== false, staffCount: countMap.get(String(d._id))?.total || 0, activeStaffCount: countMap.get(String(d._id))?.active || 0 })));
+}));
+app.get('/api/departments/:id', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'directory:read')) return;
+  if (!parseId(req.params.id)) return fail(res, 400, 'Invalid department identifier.');
+  const department = await Department.findOne({ _id: req.params.id, isDemo: isDemoMode(req) }).populate({ path: 'managerStaffId', populate: { path: 'userId', select: 'name email' } }).lean();
+  if (!department || (req.user.role !== 'admin' && department.active === false)) return fail(res, 404, 'Department not found.');
+  const counts = await HospitalMembership.aggregate([{ $match: { hospitalId: req.hospital._id, departmentId: department._id, role: { $ne: 'patient' } } }, { $group: { _id: null, total: { $sum: 1 }, active: { $sum: { $cond: ['$active', 1, 0] } } } }]);
+  res.json({ ...department, code: department.code || '', active: department.active !== false, staffCount: counts[0]?.total || 0, activeStaffCount: counts[0]?.active || 0 });
+}));
+const defaultDepartments = [
+  ['Appointment & Scheduling','APPT','Handles appointment scheduling requests'],['Patient Support','PSUP','Supports patient service and navigation requests'],['Billing & Insurance','BILL','Handles billing and insurance enquiries'],['Medical Records','MREC','Coordinates medical record requests'],['Clinical Review','CLIN','Routes clinical questions to authorized clinicians'],['Laboratory Services','LAB','Coordinates laboratory service enquiries'],['Administration','ADMIN','Hospital administrative operations'],['Call Center','CALL','Manages incoming and outgoing calls'],['IT & Systems','IT','Supports hospital information systems'],['Hospital Operations','OPS','Coordinates hospital operational services']
+];
+app.post('/api/departments/initialize', asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return fail(res, 403, 'Only a hospital administrator can initialize departments.');
+  let created = 0;
+  for (const [name, code, description] of defaultDepartments) {
+    const exists = await Department.exists({ code, isDemo: isDemoMode(req) });
+    if (exists) continue;
+    const byName = await Department.findOne({ name, isDemo: isDemoMode(req) });
+    if (byName) { if (!byName.code) { byName.code = code; await byName.save(); } continue; }
+    await Department.create({ name, code, description, active: true, isDemo: isDemoMode(req), createdBy: req.user._id }); created++;
+  }
+  await audit(req.user._id, 'department.defaults_initialized', 'Department', '', { created, mode: isDemoMode(req) ? 'demo' : 'live' });
+  res.json({ created, message: created ? `${created} missing departments initialized.` : 'Default departments already exist.' });
+}));
+app.post('/api/departments', asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return fail(res, 403, 'Only a hospital administrator can manage departments.');
+  const name = clean(req.body?.name);
+  const code = clean(req.body?.code).toUpperCase();
+  if (!name || name.length > 100) return fail(res, 400, 'Department name is required (100 characters maximum).');
+  if (!/^[A-Z0-9_-]{2,16}$/.test(code)) return fail(res, 400, 'Enter a department code (2–16 letters, numbers, hyphens, or underscores).');
+  const department = await Department.create({ name, code, description: clean(req.body?.description).slice(0, 500), active: true, isDemo: isDemoMode(req), createdBy: req.user._id });
+  await audit(req.user._id, 'department.created', 'Department', department._id);
+  res.status(201).json(department);
+}));
+app.patch('/api/departments/:id', asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return fail(res, 403, 'Only a hospital administrator can manage departments.');
+  if (!parseId(req.params.id)) return fail(res, 400, 'Invalid department identifier.');
+  const department = await Department.findOne({ _id: req.params.id, ...modeFilter(req) });
+  if (!department) return fail(res, 404, 'Department not found.');
+  if (req.body?.name !== undefined) { const name = clean(req.body.name); if (!name || name.length > 100) return fail(res, 400, 'Department name is required (100 characters maximum).'); department.name = name; }
+  if (req.body?.code !== undefined) { const code = clean(req.body.code).toUpperCase(); if (!/^[A-Z0-9_-]{2,16}$/.test(code)) return fail(res, 400, 'Enter a valid department code.'); department.code = code; }
+  if (req.body?.description !== undefined) department.description = clean(req.body.description).slice(0, 500);
+  if (req.body?.active !== undefined) { if (typeof req.body.active !== 'boolean') return fail(res, 400, 'Department active state must be a boolean.'); department.active = req.body.active; if (!req.body.active) department.managerStaffId = null; }
+  if (req.body?.managerStaffId !== undefined) {
+    if (req.body.managerStaffId === null || req.body.managerStaffId === '') department.managerStaffId = null;
+    else {
+      if (!parseId(req.body.managerStaffId)) return fail(res, 400, 'Invalid staff membership identifier.');
+      const manager = await HospitalMembership.findOne({ _id: req.body.managerStaffId, hospitalId: req.hospital._id, departmentId: department._id, active: true, role: { $ne: 'patient' } });
+      if (!manager) return fail(res, 400, 'Manager must be active staff assigned to this department.');
+      department.managerStaffId = manager._id;
+    }
+  }
+  await department.save(); await audit(req.user._id, 'department.updated', 'Department', department._id, { active: department.active, managerStaffId: department.managerStaffId }); res.json(department);
+}));
+app.get('/api/departments/:id/staff', asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return fail(res, 403, 'Only a hospital administrator can view staff management records.');
+  if (!parseId(req.params.id)) return fail(res, 400, 'Invalid department identifier.');
+  if (!await Department.exists({ _id: req.params.id, isDemo: isDemoMode(req) })) return fail(res, 404, 'Department not found.');
+  const rows = await HospitalMembership.find({ hospitalId: req.hospital._id, departmentId: req.params.id, role: { $ne: 'patient' } }).populate({ path: 'userId', select: 'name email active createdAt' }).populate('departmentId', 'name code active').sort({ employeeId: 1 }).lean();
+  res.json(rows.filter(row => row.userId).map(row => ({ ...row, fullName: row.userId.name, email: row.userId.email, isActive: row.active && row.userId.active !== false })));
+}));
+app.post('/api/staff', asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return fail(res, 403, 'Only a hospital administrator can create staff.');
+  const name = clean(req.body?.name), email = clean(req.body?.email).toLowerCase(), employeeId = clean(req.body?.employeeId).toUpperCase(), jobTitle = clean(req.body?.jobTitle), password = req.body?.password;
+  const departmentId = req.body?.departmentId, role = req.body?.role;
+  if (!name || name.length > 120 || !/^\S+@\S+\.\S+$/.test(email) || !employeeId || employeeId.length > 80 || !jobTitle || jobTitle.length > 120) return fail(res, 400, 'Provide a full name, valid email, employee ID, and job title.');
+  if (!parseId(departmentId) || !await Department.exists({ _id: departmentId, isDemo: isDemoMode(req), active: { $ne: false } })) return fail(res, 400, 'Choose an active department in this hospital.');
+  if (!accountRoles.includes(role) || ['admin', 'patient'].includes(role)) return fail(res, 400, 'Choose a non-administrator staff access role.');
+  if (typeof password !== 'string' || password.length < 12) return fail(res, 400, 'Initial password must contain at least 12 characters.');
+  const active = req.body?.active !== false;
+  if (req.body?.active !== undefined && typeof req.body.active !== 'boolean') return fail(res, 400, 'Account status must be active or inactive.');
+  if (await runWithoutHospital(() => User.exists({ email }))) return fail(res, 409, 'This email already has an account. Use the existing-account access flow instead.');
+  if (await HospitalMembership.exists({ employeeId })) return fail(res, 409, 'This employee ID is already used in this hospital.');
+  const user = await User.create({ hospitalId: req.hospital._id, hospitalIds: [req.hospital._id], name, email, role, departmentId, passwordHash: await bcrypt.hash(password, 12), active: true });
+  let membership;
+  try { membership = await HospitalMembership.create({ hospitalId: req.hospital._id, userId: user._id, role, departmentId, employeeId, jobTitle, phone: clean(req.body?.phone).slice(0, 40), active }); }
+  catch (error) { await runWithoutHospital(() => User.deleteOne({ _id: user._id })); throw error; }
+  await audit(req.user._id, 'staff.created', 'HospitalMembership', membership._id, { departmentId, role, employeeId });
+  res.status(201).json({ _id: membership._id, userId: { _id: user._id, name, email, active: true }, membershipId: membership._id, fullName: name, employeeId, email, jobTitle, departmentId, role, phone: membership.phone, active, isActive: active });
+}));
+app.get('/api/staff', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'user:manage')) return;
+  if (req.query.departmentId && !parseId(req.query.departmentId)) return fail(res, 400, 'Invalid department identifier.');
+  const filter = { hospitalId: req.hospital._id, role: { $ne: 'patient' }, ...(parseId(req.query.departmentId) ? { departmentId: req.query.departmentId } : {}) };
+  const rows = await HospitalMembership.find(filter).populate({ path: 'userId', select: 'name email active createdAt' }).populate('departmentId', 'name code active').sort({ employeeId: 1 }).lean();
+  const q = clean(req.query.q).toLowerCase(); const title = clean(req.query.jobTitle).toLowerCase(); const status = clean(req.query.status);
+  res.json(rows.filter(row => row.userId && (!q || `${row.employeeId} ${row.userId.name} ${row.userId.email}`.toLowerCase().includes(q)) && (!title || row.jobTitle.toLowerCase().includes(title)) && (!status || (status === 'active') === (row.active && row.userId.active !== false))).map(row => ({ ...row, fullName: row.userId.name, email: row.userId.email, isActive: row.active && row.userId.active !== false })));
+}));
+app.get('/api/staff/:id', asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return fail(res, 403, 'Only a hospital administrator can view staff management records.');
+  if (!parseId(req.params.id)) return fail(res, 400, 'Invalid staff membership identifier.');
+  const row = await HospitalMembership.findOne({ _id: req.params.id, hospitalId: req.hospital._id, role: { $ne: 'patient' } }).populate({ path: 'userId', select: 'name email active createdAt' }).populate('departmentId', 'name code active').lean();
+  if (!row?.userId) return fail(res, 404, 'Staff member not found.');
+  res.json({ ...row, fullName: row.userId.name, email: row.userId.email, isActive: row.active && row.userId.active !== false });
+}));
+app.patch('/api/staff/:id', asyncRoute(async (req, res) => {
+  if (req.user.role !== 'admin') return fail(res, 403, 'Only a hospital administrator can manage staff.');
+  if (!parseId(req.params.id)) return fail(res, 400, 'Invalid staff membership identifier.');
+  const membership = await HospitalMembership.findOne({ _id: req.params.id, hospitalId: req.hospital._id, role: { $ne: 'patient' } });
+  if (!membership) return fail(res, 404, 'Staff membership not found.');
+  const before = { departmentId: membership.departmentId ? String(membership.departmentId) : null, role: membership.role, active: membership.active };
+  const user = await runWithoutHospital(() => User.findById(membership.userId));
+  if (!user) return fail(res, 404, 'Staff account not found.');
+  const changes = {};
+  if (req.body?.name !== undefined) { const v = clean(req.body.name); if (!v || v.length > 120) return fail(res, 400, 'Full name is required.'); user.name = v; }
+  if (req.body?.email !== undefined) { const v = clean(req.body.email).toLowerCase(); if (!/^\S+@\S+\.\S+$/.test(v)) return fail(res, 400, 'Enter a valid email.'); user.email = v; }
+  if (req.body?.employeeId !== undefined) { const v = clean(req.body.employeeId).toUpperCase(); if (!v || v.length > 80) return fail(res, 400, 'Employee ID is required.'); changes.employeeId = v; }
+  if (req.body?.jobTitle !== undefined) { const v = clean(req.body.jobTitle); if (!v || v.length > 120) return fail(res, 400, 'Job title is required.'); changes.jobTitle = v; }
+  if (req.body?.phone !== undefined) changes.phone = clean(req.body.phone).slice(0, 40);
+  if (req.body?.departmentId !== undefined) {
+    const nextId = req.body.departmentId;
+    if (!parseId(nextId) || !await Department.exists({ _id: nextId, isDemo: isDemoMode(req), active: { $ne: false } })) return fail(res, 400, 'Destination department must exist and be active.');
+    if (String(membership.departmentId) !== String(nextId)) { changes.departmentId = nextId; await Department.updateOne({ managerStaffId: membership._id }, { $set: { managerStaffId: null } }); }
+  }
+  if (req.body?.role !== undefined) { if (!accountRoles.includes(req.body.role) || req.body.role === 'patient') return fail(res, 400, 'Choose a staff access role.'); changes.role = req.body.role; }
+  if (req.body?.active !== undefined) { if (typeof req.body.active !== 'boolean') return fail(res, 400, 'Account status must be active or inactive.'); changes.active = req.body.active; if (req.body.active === false) await Department.updateOne({ managerStaffId: membership._id }, { $set: { managerStaffId: null } }); }
+  await user.save(); Object.assign(membership, changes); await membership.save();
+  await audit(req.user._id, req.body?.departmentId && before.departmentId !== String(membership.departmentId) ? 'staff.reassigned' : 'staff.updated', 'HospitalMembership', membership._id, { before, after: { departmentId: membership.departmentId ? String(membership.departmentId) : null, active: membership.active, role: membership.role } });
+  const saved = await HospitalMembership.findById(membership._id).populate({ path: 'userId', select: 'name email active createdAt' }).populate('departmentId', 'name code active').lean();
+  res.json({ ...saved, fullName: saved.userId?.name, email: saved.userId?.email, isActive: saved.active && saved.userId?.active !== false });
 }));
 app.get('/api/patients', asyncRoute(async (req, res) => {
   if (!allowed(req, res, 'patient:read')) return;
@@ -639,10 +811,58 @@ app.post('/api/appointments', asyncRoute(async (req, res) => {
 app.patch('/api/appointments/:id/confirm', asyncRoute(async (req, res) => {
   if (!allowed(req, res, 'appointment:write')) return;
   if (!parseId(req.params.id)) return fail(res, 400, 'Invalid appointment identifier.');
-  const appointment = await Appointment.findOneAndUpdate({ _id: req.params.id, ...modeFilter(req) }, { $set: { confirmedByStaff: req.body?.confirmed === true } }, { new: true });
+  const appointment = await Appointment.findOne({ _id: req.params.id, ...modeFilter(req) });
   if (!appointment) return fail(res, 404, 'Appointment not found.');
+  if (req.body?.confirmed === true && appointment.requestStatus !== 'cancellation_requested') {
+    const proposedAt = appointment.requestStatus === 'reschedule_requested' ? appointment.requestedScheduledAt : appointment.scheduledAt;
+    if (!proposedAt || Number.isNaN(new Date(proposedAt).getTime())) return fail(res, 400, 'Appointment time is invalid.');
+    const start = new Date(proposedAt);
+    const conflictCriteria = [{ patientId: appointment.patientId }];
+    if (appointment.providerName) conflictCriteria.push({ providerName: appointment.providerName, departmentId: appointment.departmentId });
+    const conflict = await Appointment.exists({ _id: { $ne: appointment._id }, isDemo: appointment.isDemo, status: 'Scheduled', confirmedByStaff: true, scheduledAt: { $gt: new Date(start.getTime() - 30 * 60000), $lt: new Date(start.getTime() + 30 * 60000) }, $or: conflictCriteria });
+    if (conflict) return fail(res, 409, 'This time conflicts with another confirmed appointment for the patient or provider.');
+  }
+  if (req.body?.confirmed === true && appointment.requestStatus === 'cancellation_requested') {
+    appointment.status = 'Cancelled'; appointment.confirmedByStaff = false; appointment.requestStatus = 'confirmed';
+  } else if (req.body?.confirmed === true && appointment.requestStatus === 'reschedule_requested') {
+    if (!appointment.requestedScheduledAt) return fail(res, 409, 'No requested reschedule time is available.');
+    appointment.scheduledAt = appointment.requestedScheduledAt; appointment.requestedScheduledAt = null;
+  }
+  if (req.body?.confirmed === true) { appointment.confirmedByStaff = true; appointment.requestStatus = 'confirmed'; }
+  else if (['reschedule_requested', 'cancellation_requested'].includes(appointment.requestStatus)) { appointment.requestedScheduledAt = null; appointment.requestStatus = 'rejected'; }
+  else { appointment.confirmedByStaff = false; appointment.requestStatus = appointment.requestStatus === 'none' ? 'none' : 'rejected'; }
+  await appointment.save();
   await audit(req.user._id, 'appointment.verification_changed', 'Appointment', appointment._id, { confirmedByStaff: appointment.confirmedByStaff });
   res.json(appointment);
+}));
+
+app.get('/api/messages', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'message:draft')) return;
+  res.json(await PatientMessage.find(modeFilter(req)).sort({ createdAt: -1 }).limit(300).populate('patientId', 'displayName externalId').populate('appointmentId', 'scheduledAt confirmedByStaff').lean());
+}));
+app.post('/api/messages', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'message:draft')) return;
+  const body = clean(req.body?.body), channel = ['Patient portal', 'SMS', 'Email'].includes(req.body?.channel) ? req.body.channel : 'Patient portal';
+  if (!parseId(req.body?.patientId) || !body || body.length > 4000) return fail(res, 400, 'Choose a patient and enter a message (4,000 characters maximum).');
+  const patient = await Patient.findOne({ _id: req.body.patientId, ...modeFilter(req) });
+  if (!patient) return fail(res, 404, 'Patient not found in the selected data mode.');
+  let appointmentId = null;
+  if (req.body?.appointmentId) {
+    if (!parseId(req.body.appointmentId) || !await Appointment.exists({ _id: req.body.appointmentId, patientId: patient._id, confirmedByStaff: true, ...modeFilter(req) })) return fail(res, 400, 'Messages may only reference this patient’s staff-confirmed appointment.');
+    appointmentId = req.body.appointmentId;
+  }
+  const message = await PatientMessage.create({ patientId: patient._id, appointmentId, body, channel, isDemo: isDemoMode(req), createdBy: req.user._id });
+  await audit(req.user._id, 'patient_message.created', 'PatientMessage', message._id, { channel });
+  res.status(201).json(message);
+}));
+app.patch('/api/messages/:id/review', asyncRoute(async (req, res) => {
+  if (!allowed(req, res, 'message:draft')) return;
+  if (!parseId(req.params.id) || !['approve', 'reject'].includes(req.body?.action)) return fail(res, 400, 'Choose approve or reject for a valid message.');
+  const message = await PatientMessage.findOne({ _id: req.params.id, ...modeFilter(req), status: 'Pending Approval' });
+  if (!message) return fail(res, 404, 'Pending message was not found.');
+  message.status = req.body.action === 'approve' ? 'Approved' : 'Rejected'; message.reviewedBy = req.user._id; message.reviewedAt = new Date();
+  message.deliveryStatus = message.status === 'Approved' ? (message.channel === 'Patient portal' ? 'Visible in patient portal' : 'Provider not configured') : 'Not sent';
+  await message.save(); await audit(req.user._id, `patient_message.${req.body.action}d`, 'PatientMessage', message._id, { channel: message.channel, deliveryStatus: message.deliveryStatus }); res.json(message);
 }));
 
 app.get('/api/documents', asyncRoute(async (req, res) => {
