@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f5f8fc"><title>CareFlow AI — Care coordination workspace</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <a class="brand" href="#dashboard"><span class="brand-mark">✚</span><span><b>CareFlow <i>AI</i></b><small>CARE COORDINATION</small></span></a>
+    <div class="workspace-label">WORKSPACE</div>
+    <nav id="nav" aria-label="Main navigation">
+      <button class="nav-item active" data-page="dashboard"><span>▦</span>Overview</button>
+      <button class="nav-item" data-page="calls"><span>◉</span>Call center <em>3</em></button>
+      <button class="nav-item" data-page="tasks"><span>☷</span>Action queue <em id="task-count">4</em></button>
+      <button class="nav-item" data-page="appointments"><span>▣</span>Appointments</button>
+      <button class="nav-item" data-page="patients"><span>♙</span>Patient records</button>
+      <button class="nav-item" data-page="navigation"><span>⌖</span>Hospital directory</button>
+      <button class="nav-item" data-page="scribe"><span>▤</span>AI scribe <small>DEMO</small></button>
+      <button class="nav-item" data-page="messages"><span>✉</span>Communications</button>
+      <button class="nav-item" data-page="analytics"><span>▥</span>Insights & analytics</button>
+      <div class="workspace-label admin-label">ADMINISTRATION</div>
+      <button class="nav-item" data-page="operations"><span>◈</span>Operations monitor</button>
+      <button class="nav-item" data-page="admin"><span>⚙</span>Settings & directory</button>
+    </nav>
+    <div class="sidebar-bottom"><div class="privacy"><span>●</span><div><b>Demonstration workspace</b><small>Sample data · No integrations</small></div></div><button class="profile"><span class="avatar">AS</span><span><b>Ananya Sharma</b><small>Care coordinator</small></span><span class="dots">···</span></button></div>
+  </aside>
+  <main class="main-area">
+    <header class="topbar"><div class="crumb"><span>CareFlow AI</span><b>/</b><strong id="page-crumb">Overview</strong></div><div class="top-actions"><span class="demo-pill"><i></i> DEMO DATA</span><button class="icon-btn" aria-label="Notifications" id="notify">♧<span></span></button><div class="today" id="today"></div><span class="avatar top-avatar">AS</span></div></header>
+    <section id="page" class="content" aria-live="polite"></section>
+  </main>
+</div>
+<div id="toast" class="toast" role="status"></div><div id="modal-root"></div>
+<script src="./app.js"></script>
+</body></html>

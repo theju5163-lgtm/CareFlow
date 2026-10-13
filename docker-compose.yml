@@ -1,0 +1,12 @@
+services:
+  mongodb:
+    image: mongo:8
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: careflow_ai
+    ports:
+      - "27017:27017"
+    volumes:
+      - careflow-mongodb:/data/db
+volumes:
+  careflow-mongodb:
